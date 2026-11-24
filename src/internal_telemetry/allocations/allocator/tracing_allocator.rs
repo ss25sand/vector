@@ -1,5 +1,6 @@
 use std::{
     alloc::{GlobalAlloc, Layout},
+    cmp, ptr,
     sync::atomic::Ordering,
 };
 
@@ -49,16 +50,96 @@ unsafe impl<A: GlobalAlloc, T: Tracer> GlobalAlloc for GroupedTraceableAllocator
             self.dealloc_traced(object_ptr, object_layout);
         }
     }
+
+    // Without these overrides, `GlobalAlloc`'s defaults would turn every `realloc` into
+    // alloc + copy + dealloc and every `alloc_zeroed` into alloc + memset, even when allocation
+    // tracing is off. That would bypass the wrapped allocator's in-place resizing and its
+    // zeroed-page allocation.
+    #[inline]
+    unsafe fn alloc_zeroed(&self, object_layout: Layout) -> *mut u8 {
+        // SAFETY: The caller upholds `GlobalAlloc::alloc_zeroed`'s contract.
+        unsafe {
+            if !TRACK_ALLOCATIONS.load(Ordering::Relaxed) {
+                return self.allocator.alloc_zeroed(object_layout);
+            }
+            self.alloc_zeroed_traced(object_layout)
+        }
+    }
+
+    #[inline]
+    unsafe fn realloc(
+        &self,
+        object_ptr: *mut u8,
+        object_layout: Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        // SAFETY: The caller upholds `GlobalAlloc::realloc`'s contract.
+        unsafe {
+            if !TRACK_ALLOCATIONS.load(Ordering::Relaxed) {
+                return self.allocator.realloc(object_ptr, object_layout, new_size);
+            }
+            self.realloc_traced(object_ptr, object_layout, new_size)
+        }
+    }
 }
 
 impl<A: GlobalAlloc, T: Tracer> GroupedTraceableAllocator<A, T> {
     #[inline]
     unsafe fn alloc_traced(&self, object_layout: Layout) -> *mut u8 {
         // SAFETY: The caller upholds `GlobalAlloc::alloc`'s contract.
+        unsafe { self.alloc_traced_with(object_layout, |layout| self.allocator.alloc(layout)) }
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed_traced(&self, object_layout: Layout) -> *mut u8 {
+        // SAFETY: The caller upholds `GlobalAlloc::alloc_zeroed`'s contract. The group ID is
+        // written past the object, so the object's bytes stay zeroed.
+        unsafe {
+            self.alloc_traced_with(object_layout, |layout| self.allocator.alloc_zeroed(layout))
+        }
+    }
+
+    /// Reallocates like `GlobalAlloc`'s default: allocate, copy, then free.
+    ///
+    /// The group ID trailer sits right after the object, so resizing in place would move it. A
+    /// fresh traced allocation also attributes the new size to the current group, the same way
+    /// it was attributed before `realloc` was overridden.
+    #[inline]
+    unsafe fn realloc_traced(
+        &self,
+        object_ptr: *mut u8,
+        object_layout: Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        // SAFETY: The caller upholds `GlobalAlloc::realloc`'s contract: `new_size` is nonzero
+        // and does not overflow `isize` once rounded up to the alignment, and `object_ptr` was
+        // allocated by this allocator with `object_layout`.
+        unsafe {
+            let new_layout = Layout::from_size_align_unchecked(new_size, object_layout.align());
+            let new_ptr = self.alloc_traced(new_layout);
+            if !new_ptr.is_null() {
+                ptr::copy_nonoverlapping(
+                    object_ptr,
+                    new_ptr,
+                    cmp::min(object_layout.size(), new_size),
+                );
+                self.dealloc_traced(object_ptr, object_layout);
+            }
+            new_ptr
+        }
+    }
+
+    #[inline]
+    unsafe fn alloc_traced_with(
+        &self,
+        object_layout: Layout,
+        alloc: impl FnOnce(Layout) -> *mut u8,
+    ) -> *mut u8 {
+        // SAFETY: `alloc` upholds `GlobalAlloc::alloc`'s contract for the wrapped layout.
         unsafe {
             // Allocate our wrapped layout and make sure the allocation succeeded.
             let (actual_layout, offset_to_group_id) = get_wrapped_layout(object_layout);
-            let actual_ptr = self.allocator.alloc(actual_layout);
+            let actual_ptr = alloc(actual_layout);
             if actual_ptr.is_null() {
                 return actual_ptr;
             }
@@ -283,5 +364,75 @@ mod tests {
             outer_group.attach_to_span(&tracing::info_span!("without_layer"));
             assert_eq!(current_group(), root);
         });
+    }
+
+    #[test]
+    fn realloc_and_alloc_zeroed_keep_contents_and_tracking() {
+        let allocator = GroupedTraceableAllocator::new(System, RecordingTracer::default());
+        let layout = Layout::from_size_align(24, 8).unwrap();
+        assert!(!is_allocation_tracing_enabled());
+
+        // Untraced: delegated straight to the wrapped allocator, nothing is recorded.
+        // SAFETY: Every pointer is accessed within its current size and freed once with the
+        // layout it currently has.
+        unsafe {
+            let zeroed = allocator.alloc_zeroed(layout);
+            assert!(!zeroed.is_null());
+            assert!((0..24).all(|idx| zeroed.add(idx).read() == 0));
+            zeroed.write_bytes(0x5a, 24);
+
+            let grown = allocator.realloc(zeroed, layout, 4096);
+            assert!(!grown.is_null());
+            assert!((0..24).all(|idx| grown.add(idx).read() == 0x5a));
+            let grown_layout = Layout::from_size_align(4096, 8).unwrap();
+
+            let shrunk = allocator.realloc(grown, grown_layout, 8);
+            assert!(!shrunk.is_null());
+            assert!((0..8).all(|idx| shrunk.add(idx).read() == 0x5a));
+            allocator.dealloc(shrunk, Layout::from_size_align(8, 8).unwrap());
+        }
+        assert!(allocator.tracer.0.lock().unwrap().is_empty());
+
+        // Traced: called directly for the same reason as in the lifecycle test above.
+        let outer_group = AllocationGroupId::register().unwrap();
+        let inner_group = AllocationGroupId::register().unwrap();
+        with_default(Registry::default().with(AllocationLayer::default()), || {
+            let outer = tracing::info_span!("outer");
+            outer_group.attach_to_span(&outer);
+            let inner = tracing::info_span!("inner");
+            inner_group.attach_to_span(&inner);
+
+            // SAFETY: As above, through the traced paths only.
+            unsafe {
+                let zeroed = outer.in_scope(|| allocator.alloc_zeroed_traced(layout));
+                assert!(!zeroed.is_null());
+                assert!((0..24).all(|idx| zeroed.add(idx).read() == 0));
+                zeroed.write_bytes(0x5a, 24);
+
+                // A traced realloc frees from the group that allocated and allocates in the
+                // current one, and both trailers stay readable.
+                let grown = inner.in_scope(|| allocator.realloc_traced(zeroed, layout, 4096));
+                assert!(!grown.is_null());
+                assert!((0..24).all(|idx| grown.add(idx).read() == 0x5a));
+                let grown_layout = Layout::from_size_align(4096, 8).unwrap();
+
+                let shrunk = outer.in_scope(|| allocator.realloc_traced(grown, grown_layout, 8));
+                assert!(!shrunk.is_null());
+                assert!((0..8).all(|idx| shrunk.add(idx).read() == 0x5a));
+                allocator.dealloc_traced(shrunk, Layout::from_size_align(8, 8).unwrap());
+            }
+        });
+
+        assert_eq!(
+            *allocator.tracer.0.lock().unwrap(),
+            [
+                (true, 24, outer_group),
+                (true, 4096, inner_group),
+                (false, 24, outer_group),
+                (true, 8, outer_group),
+                (false, 4096, inner_group),
+                (false, 8, outer_group),
+            ]
+        );
     }
 }

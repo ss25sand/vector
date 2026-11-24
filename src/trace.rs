@@ -111,10 +111,17 @@ pub fn init(
         subscriber.with(console_layer)
     };
 
+    // Only install the allocation layer when allocation tracing is on. Allocation groups are only
+    // attached to spans when it is, so otherwise the layer would just look up every component
+    // span on each task poll for nothing. `--allocation-tracing` is read before logging starts and
+    // never changes afterwards.
     #[cfg(unix)]
     let subscriber = {
-        let allocation_layer = crate::internal_telemetry::allocations::AllocationLayer::new()
-            .with_filter(LevelFilter::ERROR);
+        let allocation_layer =
+            crate::internal_telemetry::allocations::is_allocation_tracing_enabled().then(|| {
+                crate::internal_telemetry::allocations::AllocationLayer::new()
+                    .with_filter(LevelFilter::ERROR)
+            });
 
         subscriber.with(allocation_layer)
     };
